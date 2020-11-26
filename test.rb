@@ -1,12 +1,13 @@
 require "ffi"
-require "descriptive_statistics"
-require "benchmark"
+require "benchmark/ips"
 require "terminal-table"
+require "descriptive_statistics"
 
-module SimdStatistics
+module NativeStatistics
   extend FFI::Library
   ffi_lib "./ext/build/lib.so"
-  attach_function :descriptive_statistics, [:pointer, :pointer, :pointer, :pointer, :ulong], :pointer
+  attach_function :descriptive_statistics, [:pointer, :ulong, :ulong], :pointer
+  attach_function :descriptive_statistics_simd, [:pointer, :ulong, :ulong], :pointer
   attach_function :free_stats, [:pointer], :void
 
   class StatsResult < FFI::Struct
@@ -14,17 +15,24 @@ module SimdStatistics
 
     def to_a
       (0..3).map do |i|
-        SimdStatistics::Stats.new(self[:statistics] + i * SimdStatistics::Stats.size).to_h
-      end.reverse
+        NativeStatistics::Stats.new(self[:statistics] + i * NativeStatistics::Stats.size).to_h
+      end
     end
   end
 
   class Stats < FFI::Struct
-    layout :mean, :float,
-           :min, :float,
-           :max, :float,
-           :variance, :float,
-           :standard_deviation, :float
+    layout(
+      :mean,
+      :float,
+      :min,
+      :float,
+      :max,
+      :float,
+      :variance,
+      :float,
+      :standard_deviation,
+      :float
+    )
 
     def to_h
       {
@@ -38,14 +46,44 @@ module SimdStatistics
   end
 end
 
-def test_native(data, length)
-  results_ptr = SimdStatistics.descriptive_statistics(data[0], data[1], data[2], data[3], length)
-  SimdStatistics::StatsResult.new(results_ptr)
+module RubyStatistics
+  def self.descriptive_statistics(arr, length)
+    min = Float::INFINITY
+    max = -Float::INFINITY
+    sum = 0
+
+    arr.each do |x|
+      min = x if x < min
+      max = x if x > max
+      sum += x
+    end
+
+    mean = sum / length
+    variance = arr.inject(0) { |var, x| var += ((x - mean) ** 2) / length }
+    standard_deviation = Math.sqrt(variance)
+    {mean: mean, min: min, max: max, variance: variance, standard_deviation: standard_deviation}
+  end
 end
 
-def test_ruby(data, length)
+def test_native(data, variables, length)
+  results_ptr = NativeStatistics.descriptive_statistics(data, variables, length)
+  NativeStatistics::StatsResult.new(results_ptr)
+end
+
+def test_native_simd(data, variables, length)
+  results_ptr = NativeStatistics.descriptive_statistics_simd(data, variables, length)
+  NativeStatistics::StatsResult.new(results_ptr)
+end
+
+def test_ruby_custom(data)
   data.map do |values|
-    values.descriptive_statistics.slice(:mean, :min, :max, :variance, :standard_deviation)
+    RubyStatistics.descriptive_statistics(values, values.length)
+  end
+end
+
+def test_ruby_descriptive_statistics(data)
+  data.map do |arr|
+    {mean: arr.mean, min: arr.min, max: arr.max, variance: arr.variance, standard_deviation: arr.standard_deviation}
   end
 end
 
@@ -54,73 +92,117 @@ def generate_ruby_data(length)
 end
 
 def generate_native_data(ruby_data)
-  ruby_data.map do |arr|
-    ptr =  FFI::MemoryPointer.new(:float, arr.length)
+  pointer = FFI::MemoryPointer.new(:pointer, ruby_data.length)
+
+  pointer_objects = ruby_data.map.with_index do |arr, i|
+    ptr = FFI::MemoryPointer.new(:float, arr.length)
     ptr.put_array_of_float(0, arr)
     ptr
   end
+
+  pointer.put_array_of_pointer(0, pointer_objects)
+  pointer
 end
 
-def print_results(title, results, precision = 7)
+def print_results(title, results, precision)
   headers = results[0].keys
-  values = results.map {|r| r.values.map { |v| "%.#{precision}f" % v }}
-  table = Terminal::Table.new :headings => headers, :rows => values
-  puts title + ":"
-  puts table
+  values = results.map { |r| r.values.map { |v| "%.#{precision}f" % v } }
+  table = Terminal::Table.new(:headings => headers, :rows => values)
+  puts(title + ":")
+  puts(table)
 end
 
-class TestFailure < StandardError; end
-def assert_values_within_delta(expected, actual, delta = 1e-7)
-  expected.each_with_index do |result, i|
-    actual_result = actual[i]
-    result.each do |k, v|
-      raise TestFailure.new("Results don't match!") unless (actual_result[k] - result[k]).abs < delta
+class TestFailure < StandardError
+end
+
+def assert_values_within_delta(values, delta)
+  values.each_cons(2) do |expected, actual|
+    expected.each_with_index do |result, i|
+      actual_result = actual[i]
+
+      result.each do |k, v|
+        raise TestFailure.new("Results don't match!") unless (actual_result[k] - result[k]).abs < delta
+      end
     end
   end
+
   true
 end
 
 def format_number(number)
-  number.to_s.reverse.gsub(/(\d{3})(?=\d)/, '\\1,').reverse
+  number.to_s.reverse.gsub(/(\d{3})(?=\d)/, "\\1,").reverse
 end
 
-comparison_count = 10
-puts "Comparing calculated statistics with #{format_number(comparison_count)} values..."
+def compare(comparison_count = 10, precision = 6)
+  puts("Comparing calculated statistics with #{format_number(comparison_count)} values...")
 
-begin
   ruby_data = generate_ruby_data(comparison_count)
   native_data = generate_native_data(ruby_data)
-  ruby_results = test_ruby(ruby_data, comparison_count)
-  native_results = test_native(native_data, comparison_count)
+  native_data_simd = generate_native_data(ruby_data)
 
-  precision = 7
-  print_results "Ruby", ruby_results, precision
-  print_results "Simd", native_results.to_a, precision
-  if assert_values_within_delta ruby_results, native_results.to_a, 10**(-precision)
-    puts "Test passed, results are equal to #{precision} decimal places!"
+  ruby_custom_results = test_ruby_custom(ruby_data)
+  ruby_desc_results = test_ruby_descriptive_statistics(ruby_data)
+  native_results = test_native(native_data, ruby_data.length, comparison_count)
+  native_simd_results = test_native_simd(native_data_simd, ruby_data.length, comparison_count)
+
+  print_results("Ruby (Custom)", ruby_custom_results, precision)
+  print_results("Ruby (Desc Stats)", ruby_desc_results, precision)
+  print_results("Native", native_results.to_a, precision)
+  print_results("Native (Simd)", native_simd_results.to_a, precision)
+
+  results = [
+    ruby_custom_results,
+    ruby_desc_results,
+    native_results.to_a,
+    native_simd_results.to_a
+  ]
+
+  if assert_values_within_delta(results, 10 ** (-precision))
+    puts("Test passed, results are equal to #{precision} decimal places!")
     puts
   end
+
 rescue TestFailure => e
-  puts "Test results did not match!"
+  puts("Test results did not match!")
   exit(1)
 ensure
-  SimdStatistics.free_stats(native_results)
+  NativeStatistics.free_stats(native_results) if native_results
 end
 
-benchmark_count = 1_000_000
-puts "Benchmarking with #{format_number(benchmark_count)} values..."
-ruby_data = generate_ruby_data(benchmark_count)
+def benchmark(benchmark_count = 100_000)
+  puts("Benchmarking with #{format_number(benchmark_count)} values...")
+  ruby_data = generate_ruby_data(benchmark_count)
 
-Benchmark.bmbm do |x|
-  x.report "Ruby" do
-    test_ruby(ruby_data, benchmark_count)
-  end
+  Benchmark.ips do |x|
+    x.config(warmup: 5)
 
-  x.report "Simd" do
-    # Include Ruby -> C array conversion time (for a fair benchmark comparison)
-    native_data = generate_native_data(ruby_data)
-    native_results = test_native(native_data, benchmark_count)
-  ensure
-    SimdStatistics.free_stats(native_results)
+    x.report("Ruby (Desc Stats)") do
+      test_ruby_descriptive_statistics(ruby_data)
+    end
+
+    x.report("Ruby (Custom)") do
+      test_ruby_custom(ruby_data)
+    end
+
+    x.report("Native") do
+      # Include Ruby -> C array conversion time (for a fair benchmark comparison)
+      native_data = generate_native_data(ruby_data)
+      native_results = test_native(native_data, ruby_data.length, benchmark_count)
+    ensure
+      NativeStatistics.free_stats(native_results) if native_results
+    end
+
+    x.report("Native (Simd)") do
+      # Include Ruby -> C array conversion time (for a fair benchmark comparison)
+      native_data = generate_native_data(ruby_data)
+      native_results = test_native_simd(native_data, ruby_data.length, benchmark_count)
+    ensure
+      NativeStatistics.free_stats(native_results) if native_results
+    end
+
+    x.compare!
   end
 end
+
+compare
+benchmark

@@ -1,0 +1,21 @@
+GEM
+  remote: https://rubygems.org/
+  specs:
+    benchmark-ips (2.8.3)
+    descriptive_statistics (2.5.1)
+    ffi (1.13.1)
+    terminal-table (2.0.0)
+      unicode-display_width (~> 1.1, >= 1.1.1)
+    unicode-display_width (1.7.0)
+
+PLATFORMS
+  ruby
+
+DEPENDENCIES
+  benchmark-ips
+  descriptive_statistics
+  ffi
+  terminal-table
+
+BUNDLED WITH
+   2.1.4
