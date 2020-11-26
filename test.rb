@@ -167,6 +167,7 @@ rescue TestFailure => e
   exit(1)
 ensure
   NativeStatistics.free_stats(native_results) if native_results
+  NativeStatistics.free_stats(native_simd_results) if native_simd_results
 end
 
 def benchmark(benchmark_count = 100_000)
